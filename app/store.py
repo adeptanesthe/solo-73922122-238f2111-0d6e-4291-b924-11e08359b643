@@ -111,6 +111,9 @@ class Session:
                 "created_at": self.published.manifest.get("created_at"),
                 "size_bytes": len(self.published.data),
                 "stale": self.package_is_stale(),
+                # Full manifest so the page can render metrics and the
+                # per-column response verification recorded in the ZIP.
+                "manifest": self.published.manifest,
             },
             "last_error": self.last_error,
             "last_notice": self.last_notice,

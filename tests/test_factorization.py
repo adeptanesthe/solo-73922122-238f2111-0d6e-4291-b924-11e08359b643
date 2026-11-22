@@ -161,3 +161,106 @@ def test_merge_rejects_bad_indices():
         F.merge(B1, A1, B2, A2, X, 4, [0, X.shape[1]])
     with pytest.raises(F.MergeError):
         F.merge(B1, A1, B2, A2, X, 4, [-1])
+
+
+def _disparate_scale_problem(seed=7):
+    """Independent activation directions with amplitudes 1e12 apart."""
+    rng = np.random.default_rng(seed)
+    in_dim, out_dim = 6, 6
+    B1 = rng.normal(size=(out_dim, 3))
+    A1 = rng.normal(size=(3, in_dim))
+    B2 = rng.normal(size=(out_dim, 2))
+    A2 = rng.normal(size=(2, in_dim))
+    W = B1 @ A1 + B2 @ A2
+    x_big = rng.normal(size=in_dim)
+    x_small = rng.normal(size=in_dim)
+    X = np.column_stack([x_big * 1e6, x_small * 1e-6])
+    return B1, A1, B2, A2, W, X
+
+
+def test_disparate_scales_do_not_underreport_minimum_rank():
+    _, _, _, _, W, X = _disparate_scale_problem()
+    # The small column spans an independent response direction: rank is 2,
+    # even though the raw singular values differ by ~12 orders of magnitude.
+    assert F.minimum_feasible_rank(W, X) == 2
+    raw_sv = np.linalg.svd(W @ X, compute_uv=False)
+    # The old single-cutoff logic (1e-11 relative) treated the small
+    # direction as zero; the equilibrated decision recovers it.
+    assert raw_sv[1] / raw_sv[0] < 1e-11
+
+
+@pytest.mark.parametrize("factor", [1e-12, 1e-6, 1e3, 1e12])
+def test_minimum_rank_invariant_under_single_column_scaling(factor):
+    _, _, _, _, W, X = _disparate_scale_problem()
+    base = F.minimum_feasible_rank(W, X)
+    Xs = X.copy()
+    Xs[:, 1] *= factor
+    assert F.minimum_feasible_rank(W, Xs) == base == 2
+    # Feasibility verdict must also be identical.
+    assert F.factorize_update(W, X, 2)[0].shape[1] >= 1
+    assert F.factorize_update(W, Xs, 2)[0].shape[1] >= 1
+
+
+def test_small_response_is_reproduced_column_by_column():
+    B1, A1, B2, A2, W, X = _disparate_scale_problem()
+    result = F.merge(B1, A1, B2, A2, X, 2, [0, 1])
+    assert result["minimum_feasible_rank"] == 2
+    assert len(result["column_response_checks"]) == 2
+    for row in result["column_response_checks"]:
+        assert row["passed"]
+        assert row["error_l2"] <= F.RESPONSE_COL_RTOL * max(
+            row["input_norm"], row["response_norm"]
+        )
+    # Direct per-column check on the small column, which a global max-abs
+    # tolerance would otherwise have hidden.
+    small = result["column_response_checks"][1]
+    assert small["response_norm"] < 1e-4
+    assert small["error_l2"] <= F.RESPONSE_COL_RTOL * max(
+        small["input_norm"], small["response_norm"]
+    )
+
+
+def test_per_column_check_catches_hidden_small_column_failure():
+    # A merge built at the underreported rank cannot reproduce the small
+    # independent column; the per-column check must flag it.
+    _, _, _, _, W, X = _disparate_scale_problem()
+    B, A = F.factorize_update(W, X[:, [0]], 1)  # only protects the big column
+    checks = F.per_column_response_check(B, A, W, X, [0, 1])
+    assert checks[0]["passed"]
+    assert not checks[1]["passed"]
+
+
+def test_grey_zone_rank_is_refused_not_guessed():
+    rng = np.random.default_rng(11)
+    in_dim = out_dim = 5
+    W = rng.normal(size=(out_dim, 2)) @ rng.normal(size=(2, in_dim))
+    x1 = rng.normal(size=in_dim)
+    x2 = x1 + 1e-10 * rng.normal(size=in_dim)  # near-collinear response
+    X = np.column_stack([x1, x2])
+    sv = np.linalg.svd((W @ X) / np.linalg.norm(W @ X, axis=0), compute_uv=False)
+    assert F.RANK_ZERO_RTOL < sv[1] / sv[0] < F.RANK_TRUST_RTOL
+    with pytest.raises(F.RankUndecidableError):
+        F.minimum_feasible_rank(W, X)
+    with pytest.raises(F.RankUndecidableError):
+        F.factorize_update(W, X, 4)
+
+
+def test_zero_activation_column_passes_per_column_check():
+    B1, A1, B2, A2, X = random_problem(31, in_dim=6, out_dim=6, n_act=3)
+    Xz = X.copy()
+    Xz[:, 1] = 0.0
+    result = F.merge(B1, A1, B2, A2, Xz, 6, [0, 1, 2])
+    assert all(row["passed"] for row in result["column_response_checks"])
+    zero_row = next(row for row in result["column_response_checks"] if row["index"] == 1)
+    assert zero_row["error_l2"] == 0.0
+
+
+def test_sufficient_rank_remains_frobenius_optimal_at_disparate_scales():
+    B1, A1, B2, A2, W, X = _disparate_scale_problem()
+    for rank_limit in (2, 3, 5):
+        B, A = F.factorize_update(W, X, rank_limit)
+        assert F.frobenius_distance(B, A, W) == pytest.approx(
+            F.theoretical_min_distance(W, X, rank_limit), rel=1e-9, abs=1e-9
+        )
+        checks = F.per_column_response_check(B, A, W, X, [0, 1])
+        assert all(row["passed"] for row in checks)

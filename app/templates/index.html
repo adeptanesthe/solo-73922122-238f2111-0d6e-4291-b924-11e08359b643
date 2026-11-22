@@ -85,6 +85,15 @@
           请把秩上限调到至少 {{ session.last_error.min_rank }}，或减少勾选的激活后重算。
         </div>
       {% endif %}
+      {% if session.last_error and session.last_error.kind == 'rank_undecidable' %}
+        <div style="margin-top:6px">
+          最低可行秩本次无法给出可靠数值，因此没有猜测、也没有发布新包；原下载包（如有）与
+          它的秩上限、保护项均保持不变。可尝试移除近乎共线的激活，或更换激活后重算。
+        </div>
+      {% endif %}
+      {% if session.last_error and session.last_error.kind == 'merge' %}
+        <div style="margin-top:6px">原下载包（如有）及其秩上限、保护项均保持不变。</div>
+      {% endif %}
     </div>
   {% endif %}
   {% if notice or session.last_notice %}
@@ -210,6 +219,27 @@
         <tr><td>该保护项的最低可行秩</td>
             <td class="mono">{{ session.published.manifest.metrics.minimum_feasible_rank }}</td></tr>
       </table>
+      {% if session.published.manifest.response_verification %}
+      <p class="hint" style="margin-top:12px">
+        逐列响应核验（读回 ZIP 中的因子；容差 =
+        {{ "%.0e"|format(session.published.manifest.response_verification.tolerance) }}
+        × max(本列输入‖x‖₂, 原响应‖Wx‖₂)）：
+      </p>
+      <table>
+        <tr><th>保护列</th><th>输入 ‖x‖₂</th><th>原响应 ‖Wx‖₂</th>
+            <th>误差 L2</th><th>本列容差</th><th>结论</th></tr>
+        {% for col in session.published.manifest.response_verification.columns %}
+        <tr>
+          <td class="mono">#{{ col.index }}</td>
+          <td class="mono">{{ "%.3e"|format(col.input_norm) }}</td>
+          <td class="mono">{{ "%.3e"|format(col.response_norm) }}</td>
+          <td class="mono">{{ "%.3e"|format(col.error_l2) }}</td>
+          <td class="mono">{{ "%.3e"|format(col.tolerance_l2) }}</td>
+          <td>{% if col.passed %}<span class="tag ok">通过</span>{% else %}<span class="tag err">失败</span>{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </table>
+      {% endif %}
       {% endif %}
     {% else %}
       <p class="muted">尚未生成下载包。成功计算一次合并后，这里会出现下载按钮。</p>

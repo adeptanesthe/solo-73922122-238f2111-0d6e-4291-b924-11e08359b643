@@ -202,6 +202,17 @@ async def merge(
             }
             session.last_notice = None
             return _redirect(session)
+        except factorization.RankUndecidableError as exc:
+            # The rank cannot be judged reliably: keep every published
+            # artefact and its parameters untouched and explain why.
+            session.rank_limit = rank
+            session.protected_indices = sorted(set(selected))
+            session.last_error = {
+                "kind": "rank_undecidable",
+                "message": str(exc),
+            }
+            session.last_notice = None
+            return _redirect(session)
         except (factorization.MergeError, PackageVerificationError) as exc:
             session.last_error = {"kind": "merge", "message": str(exc)}
             session.last_notice = None

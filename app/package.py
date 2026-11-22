@@ -5,12 +5,18 @@ needs:
 
 * ``B.npy`` / ``A.npy`` -- the merged factors,
 * ``manifest.json`` -- the rank limit and protected activation set *this*
-  package was built with, plus metrics and hashes,
+  package was built with, plus metrics, per-column response verification and
+  hashes,
 * ``README.txt`` -- short human-readable description.
 
 :func:`build_package` re-opens its own archive and verifies the exported
-factors reproduce the protected response before returning it.  A package that
-fails that check is never published.
+factors reproduce every protected response **column by column** before
+returning it.  The per-column L2 bound is
+``RESPONSE_COL_RTOL * max(||x_j||_2, ||W x_j||_2)``; a large protected
+column can therefore never mask a failure on a small one.  The manifest's
+minimum feasible rank is recomputed from the original inputs and must match.
+A package that fails any check is never published, leaving the previously
+published package (and its parameters) untouched.
 """
 
 from __future__ import annotations
@@ -22,6 +28,8 @@ import zipfile
 from datetime import datetime, timezone
 
 import numpy as np
+
+from .factorization import RESPONSE_COL_RTOL, minimum_feasible_rank
 
 SCHEMA = "lora-merge-package/1"
 
@@ -75,6 +83,18 @@ def build_package(result: dict, X: np.ndarray, generation: int) -> tuple[bytes, 
     if not 1 <= B.shape[0] <= 32 or not 1 <= A.shape[1] <= 32:
         raise PackageVerificationError("导出因子的层维度超出 1..32")
 
+    # Record the in-memory per-column check (the authoritative check below
+    # re-runs the same computation against the factors read back from the ZIP).
+    response_verification = {
+        "tolerance": RESPONSE_COL_RTOL,
+        "rule": "||B A x_j - W x_j||_2 <= tol * max(||x_j||_2, ||W x_j||_2)",
+        "columns": list(result.get("column_response_checks", [])),
+        "all_passed": bool(
+            result.get("column_response_checks")
+            and all(row["passed"] for row in result["column_response_checks"])
+        ),
+    }
+
     manifest = {
         "schema": SCHEMA,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -97,6 +117,7 @@ def build_package(result: dict, X: np.ndarray, generation: int) -> tuple[bytes, 
             "original_update_norm": float(result["original_update_norm"]),
             "minimum_feasible_rank": int(result["minimum_feasible_rank"]),
         },
+        "response_verification": response_verification,
         "sha256": {"B.npy": "", "A.npy": ""},
     }
 
@@ -109,13 +130,16 @@ def build_package(result: dict, X: np.ndarray, generation: int) -> tuple[bytes, 
         "LoRA merge package\n"
         "==================\n"
         f"rank_limit: {rank_limit}\n"
+        f"minimum feasible rank: {manifest['metrics']['minimum_feasible_rank']}\n"
         f"protected activation indices (0-based): {protected}\n"
         "B.npy: shape {B}\n"
         "A.npy: shape {A}\n"
-        "manifest.json: machine-readable metadata and hashes\n\n"
-        "The factors satisfy B @ (A @ X_protected) == W @ X_protected within\n"
-        "floating-point tolerance, where W is the sum of the original adapters.\n"
-    ).format(B=list(B.shape), A=list(A.shape))
+        "manifest.json: machine-readable metadata, per-column response\n"
+        "verification and hashes\n\n"
+        "The factors satisfy, per protected column j,\n"
+        "||B A x_j - W x_j||_2 <= {tol:.0e} * max(||x_j||_2, ||W x_j||_2),\n"
+        "where W is the sum of the original adapters.\n"
+    ).format(B=list(B.shape), A=list(A.shape), tol=RESPONSE_COL_RTOL)
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -130,7 +154,7 @@ def build_package(result: dict, X: np.ndarray, generation: int) -> tuple[bytes, 
 
 
 def _verify_package(zip_bytes: bytes, W, X, protected, rank_limit) -> None:
-    """Re-open the archive and self-test the exported factors."""
+    """Re-open the archive and self-test the exported factors column by column."""
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
             names = set(zf.namelist())
@@ -153,11 +177,30 @@ def _verify_package(zip_bytes: bytes, W, X, protected, rank_limit) -> None:
         raise PackageVerificationError("manifest 中的保护项与本次不一致")
 
     indices = np.asarray(protected, dtype=int)
-    target = W @ X[:, indices]
-    merged = B @ (A @ X[:, indices])
-    scale = max(1.0, float(np.linalg.norm(W, "fro")) * float(np.linalg.norm(X[:, indices], "fro")))
-    error = float(np.max(np.abs(merged - target))) if target.size else 0.0
-    if not np.isfinite(error) or error > 1e-9 * scale:
+    X_sel = X[:, indices]
+    target = W @ X_sel
+    merged = B @ (A @ X_sel)
+
+    # Column-by-column L2 check against per-column scales.
+    for col, idx in enumerate(protected):
+        x_norm = float(np.linalg.norm(X_sel[:, col]))
+        y_norm = float(np.linalg.norm(target[:, col]))
+        error = float(np.linalg.norm(merged[:, col] - target[:, col]))
+        tolerance = RESPONSE_COL_RTOL * max(x_norm, y_norm)
+        if not np.isfinite(error) or error > tolerance:
+            raise PackageVerificationError(
+                "导出的因子未通过响应自测：保护激活 #"
+                f"{int(idx)} 的 L2 误差 {error:.3e} 超过该列容差 {tolerance:.3e}"
+                f"（输入范数 {x_norm:.3e}，原响应范数 {y_norm:.3e}）"
+            )
+
+    # The minimum feasible rank in the package must be the reliable,
+    # scale-invariant rank recomputed from the original inputs.
+    min_rank = minimum_feasible_rank(W, X_sel)
+    manifest_min_rank = manifest.get("metrics", {}).get("minimum_feasible_rank")
+    if manifest_min_rank != min_rank:
         raise PackageVerificationError(
-            f"导出的因子未通过响应自测：偏差 {error:.3e}"
+            f"manifest 中的最低可行秩 {manifest_min_rank} 与重算结果 {min_rank} 不一致"
         )
+    if int(manifest.get("shared_dim", -1)) != B.shape[1]:
+        raise PackageVerificationError("manifest 中的共享维度与导出因子不一致")
